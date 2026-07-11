@@ -1,4 +1,4 @@
-mport pandas as pd
+import pandas as pd
 import os
 import time
 import streamlit as st

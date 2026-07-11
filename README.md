@@ -4,8 +4,8 @@ Assistente de dados para farmácia, alimentado por IA. Faz perguntas em portugu�
 
 *🔗 Experimenta a app ao vivo:* [farmagent-9hnyletwjpwtquxiuqsacz.streamlit.app](https://farmagent-9hnyletwjpwtquxiuqsacz.streamlit.app)
 
-<!-- Sugestão: adiciona aqui um GIF ou screenshot da app em ação -->
-<!-- ![Demo do FarmAgent](caminho-para-imagem.png) -->
+<img width="1652" height="869" alt="image" src="https://github.com/user-attachments/assets/dd491617-ac5d-4ea0-ad10-5e1c58a854a1" />
+
 
 ---
 

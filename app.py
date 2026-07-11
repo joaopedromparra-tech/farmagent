@@ -157,13 +157,13 @@ def calcular_kpis(dados):
     kpis = {}
     if "Vendas" in dados:
         vendas = dados["Vendas"]
-        if "total" in vendas.columns:
-            kpis["Vendas totais"] = f"{vendas['total'].sum():,.2f} €"
-            kpis["Ticket médio"] = f"{vendas['total'].mean():,.2f} €"
+        if "Total" in vendas.columns:
+            kpis["Vendas totais"] = f"{vendas['Total'].sum():,.2f} €"
+            kpis["Ticket médio"] = f"{vendas['Total'].mean():,.2f} €"
     if "Produtos" in dados:
         produtos = dados["Produtos"]
-        if "stock" in produtos.columns and "stock_minimo" in produtos.columns:
-            abaixo_minimo = (produtos["stock"] < produtos["stock_minimo"]).sum()
+        if "Stock" in produtos.columns and "Stock_Minimo" in produtos.columns:
+            abaixo_minimo = (produtos["Stock"] < produtos["Stock_Minimo"]).sum()
             kpis["Produtos em rutura"] = int(abaixo_minimo)
     if "Clientes" in dados:
         kpis["Clientes registados"] = len(dados["Clientes"])

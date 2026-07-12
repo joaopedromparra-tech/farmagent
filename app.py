@@ -9,73 +9,78 @@ import json
 
 client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
-EXCEL_PADRAO = "farmacia_complexa.xlsx"
+DEFAULT_EXCEL = "farmacia_complexa.xlsx"
 
-PERGUNTAS_EXEMPLO = [
-    "Quais os 5 produtos mais vendidos?",
-    "Qual o total de vendas por mês?",
-    "Quais clientes têm mais pontos de fidelidade?",
-    "Que produtos têm stock abaixo do mínimo?",
+EXAMPLE_QUESTIONS = [
+    "What are the 5 best-selling products?",
+    "What are total sales by month?",
+    "Which customers have the most loyalty points?",
+    "Which products are below minimum stock?",
 ]
 
-PALAVRAS_PROIBIDAS = ["DROP", "DELETE", "UPDATE", "ALTER", "INSERT", "TRUNCATE", "ATTACH", "PRAGMA"]
+FORBIDDEN_KEYWORDS = ["DROP", "DELETE", "UPDATE", "ALTER", "INSERT", "TRUNCATE", "ATTACH", "PRAGMA"]
+
+CHART_CONFIG = {
+    "displaylogo": False,
+    "modeBarButtonsToAdd": ["toggleFullscreen"],
+}
 
 
 @st.cache_data
-def carregar_dados_ficheiro(ficheiro):
-    sheets = pd.read_excel(ficheiro, sheet_name=None)
-    return {nome: df for nome, df in sheets.items() if nome != "Resumo"}
+def load_data(file):
+    sheets = pd.read_excel(file, sheet_name=None)
+    return {name: df for name, df in sheets.items() if name != "Resumo"}
 
 
-def get_schema(dados):
+def get_schema(data):
     schema = ""
-    for nome, df in dados.items():
-        colunas = ", ".join([f"{col} ({str(df[col].dtype)})" for col in df.columns])
-        schema += f"Tabela '{nome}': {colunas}\n\n"
+    for name, df in data.items():
+        cols = ", ".join([f"{col} ({str(df[col].dtype)})" for col in df.columns])
+        schema += f"Table '{name}': {cols}\n\n"
     return schema
 
 
-def sql_e_seguro(sql):
+def sql_is_safe(sql):
     sql_upper = sql.upper()
-    return not any(palavra in sql_upper for palavra in PALAVRAS_PROIBIDAS)
+    return not any(word in sql_upper for word in FORBIDDEN_KEYWORDS)
 
 
-def run_query(dados, sql):
-    if not sql_e_seguro(sql):
-        return "Operação não permitida: apenas consultas de leitura (SELECT) são aceites."
+def run_query(data, sql):
+    if not sql_is_safe(sql):
+        return "Operation not allowed: only read-only (SELECT) queries are accepted."
 
     conn = sqlite3.connect(":memory:")
-    for nome, df in dados.items():
-        df.to_sql(nome, conn, index=False, if_exists="replace")
+    for name, df in data.items():
+        df.to_sql(name, conn, index=False, if_exists="replace")
     try:
-        resultado = pd.read_sql_query(sql, conn)
+        result = pd.read_sql_query(sql, conn)
         conn.close()
-        return resultado
+        return result
     except Exception as e:
         conn.close()
         return str(e)
 
 
-def gerar_sql(pergunta, contexto, schema, erro_anterior=None, sql_anterior=None):
-    prompt = f"""Base de dados SQLite:
+def generate_sql(question, context, schema, previous_error=None, previous_sql=None):
+    prompt = f"""SQLite database:
 {schema}
 
-Histórico da conversa até agora:
-{contexto}
+Conversation history so far:
+{context}
 
-Nova pergunta: {pergunta}
+New question: {question}
 
-Responde APENAS com SQL, sem markdown, sem backticks."""
+Reply ONLY with SQL, no markdown, no backticks."""
 
-    if erro_anterior:
-        prompt = f"""Base de dados SQLite:
+    if previous_error:
+        prompt = f"""SQLite database:
 {schema}
 
-A tentativa anterior de gerar SQL para a pergunta "{pergunta}" falhou.
-SQL tentado: {sql_anterior}
-Erro obtido: {erro_anterior}
+The previous attempt to generate SQL for the question "{question}" failed.
+Attempted SQL: {previous_sql}
+Error received: {previous_error}
 
-Corrige o SQL e responde APENAS com o SQL corrigido, sem markdown, sem backticks."""
+Fix the SQL and reply ONLY with the corrected SQL, no markdown, no backticks."""
 
     return client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -83,94 +88,108 @@ Corrige o SQL e responde APENAS com o SQL corrigido, sem markdown, sem backticks
     ).choices[0].message.content.strip()
 
 
-def agente(pergunta, historico, dados, status):
-    schema = get_schema(dados)
-    contexto = "".join(
-        [f"Utilizador: {t['pergunta']}\nResposta: {t['resposta']}\n\n" for t in historico]
+def pick_chart(result_df):
+    """Decide chart type locally from the shape of the result, no extra LLM call needed."""
+    if result_df is None or len(result_df.columns) != 2 or len(result_df) < 2:
+        return None
+
+    col_x, col_y = result_df.columns[0], result_df.columns[1]
+    if not pd.api.types.is_numeric_dtype(result_df[col_y]):
+        return None
+
+    is_date_like = "date" in col_x.lower() or "data" in col_x.lower() or pd.api.types.is_datetime64_any_dtype(result_df[col_x])
+    colors = px.colors.sequential.Teal
+
+    if is_date_like:
+        fig = px.line(result_df, x=col_x, y=col_y, color_discrete_sequence=colors)
+    elif len(result_df) <= 12:
+        fig = px.bar(result_df, x=col_x, y=col_y, color_discrete_sequence=colors)
+    else:
+        return None
+
+    fig.update_layout(
+        title_font_size=16,
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        margin=dict(t=30, l=10, r=10, b=10),
     )
+    return fig
 
-    status.update(label="A gerar consulta SQL...")
-    sql_gerado = gerar_sql(pergunta, contexto, schema)
-    resultado_df = run_query(dados, sql_gerado)
 
-    # Auto-correção: se falhar, tenta corrigir uma vez
-    if isinstance(resultado_df, str):
-        status.update(label="A corrigir a consulta...")
-        sql_corrigido = gerar_sql(pergunta, contexto, schema, erro_anterior=resultado_df, sql_anterior=sql_gerado)
-        resultado_novo = run_query(dados, sql_corrigido)
-        if not isinstance(resultado_novo, str):
-            sql_gerado = sql_corrigido
-            resultado_df = resultado_novo
-        else:
-            return resultado_novo, sql_gerado, None, None
+def stream_answer(question, context, result_str):
+    prompt = f"""Conversation history:
+{context}
 
-    resultado_str = resultado_df.to_string(index=False)
+Current question: {question}
+SQL result: {result_str}
 
-    status.update(label="A preparar a resposta...")
-    resposta_raw = client.chat.completions.create(
+Answer the question in clear, natural English. Use the conversation history for
+context and comparisons when relevant. Do not mention SQL or databases explicitly
+in your answer, just give the business answer. Keep it concise (2-4 sentences
+unless the data calls for more detail)."""
+
+    stream = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": f"""Histórico da conversa:
-{contexto}
-
-Pergunta atual: {pergunta}
-Resultado SQL: {resultado_str}
-
-Responde em JSON com este formato exato:
-{{"resposta": "resposta completa em português considerando todo o histórico", "grafico": "bar|line|pie|none", "x": "coluna_x", "y": "coluna_y"}}
-
-IMPORTANTE: Usa o histórico para dar respostas contextualizadas e comparativas quando relevante.
-Responde APENAS com JSON, sem markdown."""}]
-    ).choices[0].message.content.strip()
-
-    try:
-        resposta_raw = resposta_raw.replace("```json", "").replace("```", "").strip()
-        dados_resposta = json.loads(resposta_raw)
-        resposta_texto = dados_resposta.get("resposta", "")
-        tipo_grafico = dados_resposta.get("grafico", "none")
-        col_x = dados_resposta.get("x", "")
-        col_y = dados_resposta.get("y", "")
-
-        grafico = None
-        if tipo_grafico != "none" and col_x in resultado_df.columns and col_y in resultado_df.columns:
-            cores = px.colors.sequential.Teal
-            if tipo_grafico == "bar":
-                grafico = px.bar(resultado_df, x=col_x, y=col_y, title=pergunta, color_discrete_sequence=cores)
-            elif tipo_grafico == "line":
-                grafico = px.line(resultado_df, x=col_x, y=col_y, title=pergunta, color_discrete_sequence=cores)
-            elif tipo_grafico == "pie":
-                grafico = px.pie(resultado_df, names=col_x, values=col_y, title=pergunta, color_discrete_sequence=cores)
-
-            if grafico:
-                grafico.update_layout(
-                    title_font_size=16,
-                    plot_bgcolor="rgba(0,0,0,0)",
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    margin=dict(t=50, l=10, r=10, b=10),
-                )
-
-        return resposta_texto, sql_gerado, grafico, resultado_df
-    except Exception:
-        return resultado_str, sql_gerado, None, resultado_df
+        messages=[{"role": "user", "content": prompt}],
+        stream=True,
+    )
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content
+        if delta:
+            yield delta
 
 
-def calcular_kpis(dados):
+def cache_key(question, data):
+    fingerprint = "|".join(f"{name}:{len(df)}" for name, df in data.items())
+    return f"{question.strip().lower()}::{fingerprint}"
+
+
+def run_agent(question, history, data, status):
+    schema = get_schema(data)
+    context = "".join([f"User: {t['question']}\nAnswer: {t['answer']}\n\n" for t in history])
+
+    status.update(label="Generating SQL query...")
+    sql = generate_sql(question, context, schema)
+    result_df = run_query(data, sql)
+
+    if isinstance(result_df, str):
+        status.update(label="Fixing the query...")
+        fixed_sql = generate_sql(question, context, schema, previous_error=result_df, previous_sql=sql)
+        new_result = run_query(data, fixed_sql)
+        if not isinstance(new_result, str):
+            sql = fixed_sql
+            result_df = new_result
+        else:
+            return new_result, sql, None, None
+
+    result_str = result_df.to_string(index=False)
+    chart = pick_chart(result_df)
+    return result_str, sql, chart, result_df
+
+
+def calculate_kpis(data):
     kpis = {}
-    if "Vendas" in dados:
-        vendas = dados["Vendas"]
-        if "Total" in vendas.columns:
-            kpis["Vendas totais"] = f"{vendas['Total'].sum():,.2f} €"
-            kpis["Ticket médio"] = f"{vendas['Total'].mean():,.2f} €"
-    if "Produtos" in dados:
-        produtos = dados["Produtos"]
-        if "Stock" in produtos.columns and "Stock_Minimo" in produtos.columns:
-            abaixo_minimo = (produtos["Stock"] < produtos["Stock_Minimo"]).sum()
-            kpis["Produtos em rutura"] = int(abaixo_minimo)
-    if "Clientes" in dados:
-        kpis["Clientes registados"] = len(dados["Clientes"])
+    if "Vendas" in data:
+        sales = data["Vendas"]
+        if "Total" in sales.columns:
+            kpis["Total Sales"] = f"€{sales['Total'].sum():,.2f}"
+            kpis["Avg. Ticket"] = f"€{sales['Total'].mean():,.2f}"
+    if "Produtos" in data:
+        products = data["Produtos"]
+        if "Stock" in products.columns and "Stock_Minimo" in products.columns:
+            low_stock = (products["Stock"] < products["Stock_Minimo"]).sum()
+            kpis["Low Stock Items"] = int(low_stock)
+    if "Clientes" in data:
+        kpis["Registered Customers"] = len(data["Clientes"])
     return kpis
 
 
-# ---------- Config da página ----------
+@st.dialog("Chart — Full View", width="large")
+def show_chart_modal(fig):
+    st.plotly_chart(fig, use_container_width=True, config=CHART_CONFIG)
+
+
+# ---------- Page config ----------
 st.set_page_config(page_title="FarmAgent", page_icon="💊", layout="wide")
 
 st.markdown("""
@@ -191,120 +210,156 @@ footer {visibility: hidden;}
 st.markdown("""
 <div class="farmagent-header">
     <h1>💊 FarmAgent</h1>
-    <p>O teu assistente de dados para farmácia — pergunta em português, recebe respostas e gráficos automáticos.</p>
+    <p>Your AI-powered pharmacy data assistant — ask questions in plain English, get answers and charts instantly.</p>
 </div>
 """, unsafe_allow_html=True)
 
-# ---------- Estado ----------
-if "dados" not in st.session_state:
-    st.session_state.dados = None
-if "historico" not in st.session_state:
-    st.session_state.historico = []
-if "mensagens" not in st.session_state:
-    st.session_state.mensagens = []
-if "usando_exemplo" not in st.session_state:
-    st.session_state.usando_exemplo = False
+# ---------- State ----------
+if "data" not in st.session_state:
+    st.session_state.data = None
+if "history" not in st.session_state:
+    st.session_state.history = []
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "using_sample" not in st.session_state:
+    st.session_state.using_sample = False
+if "cache" not in st.session_state:
+    st.session_state.cache = {}
 
-if st.session_state.dados is None and os.path.exists(EXCEL_PADRAO):
-    st.session_state.dados = carregar_dados_ficheiro(EXCEL_PADRAO)
-    st.session_state.usando_exemplo = True
+if st.session_state.data is None and os.path.exists(DEFAULT_EXCEL):
+    st.session_state.data = load_data(DEFAULT_EXCEL)
+    st.session_state.using_sample = True
 
 # ---------- Sidebar ----------
 with st.sidebar:
-    st.header("📂 Dados")
+    st.header("📂 Data")
 
-    if st.session_state.usando_exemplo:
-        st.success("A usar dados de exemplo de uma farmácia fictícia.")
+    if st.session_state.using_sample:
+        st.success("Using sample data from a fictional pharmacy.")
 
-    ficheiro = st.file_uploader("Carrega o teu próprio ficheiro Excel", type=["xlsx"])
-    if ficheiro:
-        novos_dados = carregar_dados_ficheiro(ficheiro)
-        if st.button("🔄 Substituir dados atuais"):
-            st.session_state.dados = novos_dados
-            st.session_state.usando_exemplo = False
-            st.session_state.historico = []
-            st.session_state.mensagens = []
-            st.success("Dados substituídos!")
+    uploaded_file = st.file_uploader("Upload your own Excel file", type=["xlsx"])
+    if uploaded_file:
+        new_data = load_data(uploaded_file)
+        if st.button("🔄 Replace current data"):
+            st.session_state.data = new_data
+            st.session_state.using_sample = False
+            st.session_state.history = []
+            st.session_state.messages = []
+            st.session_state.cache = {}
+            st.success("Data replaced!")
             st.rerun()
 
-    if st.session_state.dados:
+    if st.session_state.data:
         st.divider()
-        st.subheader("📊 Tabelas carregadas")
-        for nome, df in st.session_state.dados.items():
-            st.caption(f"• {nome}: {len(df)} linhas")
+        st.subheader("📊 Loaded tables")
+        for name, df in st.session_state.data.items():
+            st.caption(f"• {name}: {len(df)} rows")
         st.divider()
-        if st.button("🗑️ Limpar conversa"):
-            st.session_state.historico = []
-            st.session_state.mensagens = []
+        if st.button("🗑️ Clear conversation"):
+            st.session_state.history = []
+            st.session_state.messages = []
             st.rerun()
 
     st.divider()
-    st.caption("Feito por João Pedro Parra 🧪")
+    st.caption("Built by João Pedro Parra 🧪")
 
-# ---------- Corpo principal ----------
-if st.session_state.dados is None:
-    st.info("👈 Carrega um ficheiro Excel na barra lateral para começar.")
+# ---------- Main body ----------
+if st.session_state.data is None:
+    st.info("👈 Upload an Excel file in the sidebar to get started.")
 else:
-    kpis = calcular_kpis(st.session_state.dados)
+    kpis = calculate_kpis(st.session_state.data)
     if kpis:
-        cols_kpi = st.columns(len(kpis))
-        for col, (nome, valor) in zip(cols_kpi, kpis.items()):
-            col.metric(nome, valor)
+        kpi_cols = st.columns(len(kpis))
+        for col, (name, value) in zip(kpi_cols, kpis.items()):
+            col.metric(name, value)
         st.divider()
 
-    if not st.session_state.mensagens:
-        st.write("*Experimenta perguntar:*")
-        cols = st.columns(len(PERGUNTAS_EXEMPLO))
-        for col, pergunta_exemplo in zip(cols, PERGUNTAS_EXEMPLO):
-            if col.button(pergunta_exemplo, use_container_width=True):
-                st.session_state["pergunta_pendente"] = pergunta_exemplo
+    if not st.session_state.messages:
+        st.write("*Try asking:*")
+        cols = st.columns(len(EXAMPLE_QUESTIONS))
+        for col, example in zip(cols, EXAMPLE_QUESTIONS):
+            if col.button(example, use_container_width=True):
+                st.session_state["pending_question"] = example
 
-    for i, msg in enumerate(st.session_state.mensagens):
+    for i, msg in enumerate(st.session_state.messages):
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
-            if msg.get("grafico") is not None:
-                st.plotly_chart(msg["grafico"], use_container_width=True, key=f"grafico_{i}")
-            if msg.get("tabela") is not None:
+            if msg.get("chart") is not None:
+                c1, c2 = st.columns([6, 1])
+                with c1:
+                    st.plotly_chart(msg["chart"], use_container_width=True, key=f"chart_{i}", config=CHART_CONFIG)
+                with c2:
+                    if hasattr(st, "dialog") and st.button("⛶ Expand", key=f"expand_{i}"):
+                        show_chart_modal(msg["chart"])
+            if msg.get("table") is not None:
                 st.download_button(
-                    "⬇️ Descarregar resultados (CSV)",
-                    msg["tabela"].to_csv(index=False).encode("utf-8"),
-                    file_name="resultado_farmagent.csv",
+                    "⬇️ Download results (CSV)",
+                    msg["table"].to_csv(index=False).encode("utf-8"),
+                    file_name="farmagent_results.csv",
                     mime="text/csv",
                     key=f"download_{i}",
                 )
 
-    pergunta = st.chat_input("Faz uma pergunta sobre os dados...")
-    if not pergunta and "pergunta_pendente" in st.session_state:
-        pergunta = st.session_state.pop("pergunta_pendente")
+    question = st.chat_input("Ask a question about the data...")
+    if not question and "pending_question" in st.session_state:
+        question = st.session_state.pop("pending_question")
 
-    if pergunta:
-        st.chat_message("user").write(pergunta)
-        st.session_state.mensagens.append({"role": "user", "content": pergunta, "grafico": None, "tabela": None})
+    if question:
+        st.chat_message("user").write(question)
+        st.session_state.messages.append({"role": "user", "content": question, "chart": None, "table": None})
 
-        inicio = time.time()
-        with st.status("A analisar...", expanded=False) as status:
-            resposta, sql, grafico, tabela = agente(pergunta, st.session_state.historico, st.session_state.dados, status)
-            status.update(label="Concluído", state="complete")
-        duracao = time.time() - inicio
+        key = cache_key(question, st.session_state.data)
+        cached = st.session_state.cache.get(key)
+        start = time.time()
 
         with st.chat_message("assistant"):
-            st.write(resposta)
-            if grafico:
-                st.plotly_chart(grafico, use_container_width=True, key=f"grafico_novo_{len(st.session_state.mensagens)}")
-            if tabela is not None and not isinstance(tabela, str):
-                st.download_button(
-                    "⬇️ Descarregar resultados (CSV)",
-                    tabela.to_csv(index=False).encode("utf-8"),
-                    file_name="resultado_farmagent.csv",
-                    mime="text/csv",
-                    key=f"download_novo_{len(st.session_state.mensagens)}",
-                )
-            with st.expander("SQL gerado"):
-                st.code(sql, language="sql")
-            st.caption(f"⏱️ Resposta gerada em {duracao:.1f}s")
+            if cached:
+                st.write(cached["answer"])
+                answer_text = cached["answer"]
+                sql, chart, table = cached["sql"], cached["chart"], cached["table"]
+                st.caption("⚡ Cached response")
+            else:
+                with st.status("Analyzing...", expanded=False) as status:
+                    result_str, sql, chart, table = run_agent(
+                        question, st.session_state.history, st.session_state.data, status
+                    )
+                    status.update(label="Done", state="complete")
 
-        st.session_state.mensagens.append({
-            "role": "assistant", "content": resposta, "grafico": grafico,
-            "tabela": tabela if not isinstance(tabela, str) else None
+                if table is None and isinstance(result_str, str) and chart is None:
+                    # Query failed even after auto-fix
+                    st.write(result_str)
+                    answer_text = result_str
+                else:
+                    context = "".join(
+                        [f"User: {t['question']}\nAnswer: {t['answer']}\n\n" for t in st.session_state.history]
+                    )
+                    answer_text = st.write_stream(stream_answer(question, context, result_str))
+
+            if chart:
+                c1, c2 = st.columns([6, 1])
+                with c1:
+                    st.plotly_chart(chart, use_container_width=True, key=f"chart_new_{len(st.session_state.messages)}", config=CHART_CONFIG)
+                with c2:
+                    if hasattr(st, "dialog") and st.button("⛶ Expand", key=f"expand_new_{len(st.session_state.messages)}"):
+                        show_chart_modal(chart)
+            if table is not None and not isinstance(table, str):
+                st.download_button(
+                    "⬇️ Download results (CSV)",
+                    table.to_csv(index=False).encode("utf-8"),
+                    file_name="farmagent_results.csv",
+                    mime="text/csv",
+                    key=f"download_new_{len(st.session_state.messages)}",
+                )
+            with st.expander("Generated SQL"):
+                st.code(sql, language="sql")
+            duration = time.time() - start
+            st.caption(f"⏱️ Answered in {duration:.1f}s")
+
+        st.session_state.messages.append({
+            "role": "assistant", "content": answer_text, "chart": chart,
+            "table": table if not isinstance(table, str) else None
         })
-        st.session_state.historico.append({"pergunta": pergunta, "resposta": resposta})
+        st.session_state.history.append({"question": question, "answer": answer_text})
+
+        if not cached:
+            st.session_state.cache[key] = {"answer": answer_text, "sql": sql, "chart": chart, "table": table}

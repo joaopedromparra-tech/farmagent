@@ -196,13 +196,35 @@ st.markdown("""
 <style>
 .stApp { background-color: #0e1117; }
 .farmagent-header {
-    padding: 1.2rem 1.5rem;
-    border-radius: 14px;
+    padding: 1.4rem 1.6rem;
+    border-radius: 16px;
     background: linear-gradient(135deg, #0f766e 0%, #134e4a 100%);
     margin-bottom: 1.5rem;
+    box-shadow: 0 4px 20px rgba(15, 118, 110, 0.25);
 }
-.farmagent-header h1 { color: white; margin: 0; font-size: 2rem; }
-.farmagent-header p { color: #ccfbf1; margin: 0.3rem 0 0 0; font-size: 0.95rem; }
+.farmagent-header h1 { color: white; margin: 0; font-size: 2.1rem; }
+.farmagent-header p { color: #ccfbf1; margin: 0.35rem 0 0 0; font-size: 0.97rem; }
+.empty-state {
+    text-align: center;
+    padding: 3rem 1.5rem;
+    border: 1px dashed #2d3748;
+    border-radius: 16px;
+    background-color: #131720;
+    margin-top: 1rem;
+}
+.empty-state .icon { font-size: 2.5rem; }
+.empty-state h3 { color: #e6edf3; margin: 0.6rem 0 0.3rem 0; }
+.empty-state p { color: #8b949e; margin: 0; font-size: 0.92rem; }
+div[data-testid="stButton"] button {
+    border-radius: 10px;
+    border: 1px solid #1f6f65;
+    transition: all 0.15s ease;
+}
+div[data-testid="stButton"] button:hover {
+    border-color: #14b8a6;
+    color: #14b8a6;
+    transform: translateY(-1px);
+}
 footer {visibility: hidden;}
 </style>
 """, unsafe_allow_html=True)
@@ -213,6 +235,20 @@ st.markdown("""
     <p>Your AI-powered pharmacy data assistant — ask questions in plain English, get answers and charts instantly.</p>
 </div>
 """, unsafe_allow_html=True)
+
+with st.expander("ℹ️ How it works"):
+    st.markdown("""
+FarmAgent turns your Excel spreadsheet into a queryable database and lets an LLM
+(Groq's Llama 3.3 70B) translate your questions into SQL on the fly.
+
+1. *You ask* a question in plain English
+2. The *LLM generates SQL* against an in-memory SQLite database built from your spreadsheet
+3. If the query fails, the agent *automatically retries* with the error fed back to the model
+4. The result is turned into a *natural-language answer*, streamed back to you in real time
+5. A *chart is chosen automatically* based on the shape of the result — no extra AI call needed
+
+All generated SQL is read-only by design — no destructive operations are ever allowed to run.
+""")
 
 # ---------- State ----------
 if "data" not in st.session_state:
@@ -265,7 +301,13 @@ with st.sidebar:
 
 # ---------- Main body ----------
 if st.session_state.data is None:
-    st.info("👈 Upload an Excel file in the sidebar to get started.")
+    st.markdown("""
+    <div class="empty-state">
+        <div class="icon">📂</div>
+        <h3>No data loaded yet</h3>
+        <p>Upload an Excel file in the sidebar to get started.</p>
+    </div>
+    """, unsafe_allow_html=True)
 else:
     kpis = calculate_kpis(st.session_state.data)
     if kpis:
@@ -282,7 +324,8 @@ else:
                 st.session_state["pending_question"] = example
 
     for i, msg in enumerate(st.session_state.messages):
-        with st.chat_message(msg["role"]):
+        avatar = "💊" if msg["role"] == "assistant" else "🧑"
+        with st.chat_message(msg["role"], avatar=avatar):
             st.write(msg["content"])
             if msg.get("chart") is not None:
                 c1, c2 = st.columns([6, 1])
@@ -305,14 +348,14 @@ else:
         question = st.session_state.pop("pending_question")
 
     if question:
-        st.chat_message("user").write(question)
+        st.chat_message("user", avatar="🧑").write(question)
         st.session_state.messages.append({"role": "user", "content": question, "chart": None, "table": None})
 
         key = cache_key(question, st.session_state.data)
         cached = st.session_state.cache.get(key)
         start = time.time()
 
-        with st.chat_message("assistant"):
+        with st.chat_message("assistant", avatar="💊"):
             if cached:
                 st.write(cached["answer"])
                 answer_text = cached["answer"]
